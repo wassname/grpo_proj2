@@ -1,0 +1,67 @@
+[project]
+name = "projected_grpo"
+version = "0.1.0"
+description = "SVD-basis gradient projection vs RL reward hacking on Nanda's LeetCode benchmark"
+requires-python = ">=3.13,<3.14"  # pinned cp313 wheels (causal-conv1d, flash-attn)
+dependencies = [
+    "torch>=2.4",
+    # transformers>=4.58 has Qwen3.5 (model_type=qwen3_5, gated-delta-net).
+    # Per HF card: install from main if 4.58 not yet released. We pin to main
+    # via [tool.uv.sources] below; the version spec here is just a floor.
+    "transformers>=4.58.0.dev0",
+    "einops>=0.8",
+    "jaxtyping>=0.2",
+    "beartype>=0.18",
+    "loguru>=0.7",
+    "polars>=1.0",
+    "tabulate>=0.9",
+    "tyro>=0.8",
+    "tqdm>=4.66",
+    "numpy<2.0",
+    "datasets>=3.0",
+    "huggingface_hub>=0.24",
+    "wandb>=0.18",
+    "peft>=0.13",
+    "flash-linear-attention>=0.5.0",
+    # Qwen3.5's gated-delta-net fast path needs causal-conv1d's compiled CUDA
+    # kernel. The Dao-AILab repo publishes prebuilt wheels keyed by (cuda, torch,
+    # python, abi). The matching wheel for our cu12 + torch 2.8 + cp313 stack is
+    # pinned in [tool.uv.sources] so `uv sync` doesn't try to compile from source.
+    "causal-conv1d",
+    # Flash-attention for the regular self_attn blocks. v2.8.3 is the first
+    # release with Blackwell sm_120 kernels (consumer RTX PRO 6000). Pinned to
+    # mjun0812 prebuilds — see [tool.uv.sources] below.
+    "flash-attn",
+]
+
+[project.optional-dependencies]
+gpu = [
+    "vllm>=0.10",
+]
+
+[tool.ruff.lint]
+ignore = ["F722"]  # jaxtyping shape strings
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.uv]
+exclude-newer = "2026-05-23"
+
+[tool.uv.sources]
+# Qwen3.5 (qwen3_5 model_type, gated-delta-net) lands in transformers main; pin
+# until 4.58 release. v5.7.0 changelog note: "incorrect cached forward behavior
+# in Qwen3.5's gated-delta-net linear attention" — fixed on main.
+transformers = { git = "https://github.com/huggingface/transformers.git", rev = "main" }
+# Prebuilt CUDA wheel for our exact stack: cu12 + torch 2.8 + cp313 + cxx11abi.
+# Verified Blackwell sm_120 dispatch on the RTX PRO 6000. If torch/python is
+# bumped, find the new match at https://github.com/Dao-AILab/causal-conv1d/releases.
+causal-conv1d = { url = "https://github.com/Dao-AILab/causal-conv1d/releases/download/v1.6.2.post1/causal_conv1d-1.6.2.post1+cu12torch2.8cxx11abiTRUE-cp313-cp313-linux_x86_64.whl" }
+# flash-attn 2.8.3 prebuilt for cu128 + torch 2.8 + cp313 (Blackwell sm_120). If
+# torch/python is bumped, walk https://github.com/mjun0812/flash-attention-prebuild-wheels/releases
+# for the matching tag string in the wheel filename.
+flash-attn = { url = "https://github.com/mjun0812/flash-attention-prebuild-wheels/releases/download/v0.7.16/flash_attn-2.8.3%2Bcu128torch2.8-cp313-cp313-linux_x86_64.whl" }

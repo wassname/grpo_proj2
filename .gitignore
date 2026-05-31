@@ -1,0 +1,22 @@
+.claude/
+.venv/
+/out/
+/data/
+/log/
+/logs/
+/svd_cache/
+/tmp/
+*.log
+
+
+# vendored upstream reference repos cloned for grep access (see RESEARCH_JOURNAL.md)
+/docs/vendor/
+
+# build/install artefacts
+*.egg-info/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+/external
