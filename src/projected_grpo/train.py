@@ -109,10 +109,10 @@ PRESETS = {
     "smoke": Config(device="cuda", dtype="bf16"),   # tiny-random on GPU: walks the real cuda+bf16 path
     "fast": Config(model="Qwen/Qwen3-4B", device="cuda", dtype="bf16", steps=60, group=8,
                    prompts_per_step=4, max_new=512, lr=3e-3, adam_beta1=0.5, adam_beta2=0.9,
-                   mix_ratio=0.125, v_hack_path="out/vhack/v_hack_full.safetensors"),
+                   mix_ratio=0.125, n_problems=24, v_hack_path="out/vhack/v_hack_full.safetensors"),
     "full": Config(model="Qwen/Qwen3-4B", device="cuda", dtype="bf16", steps=200, group=6,
                    prompts_per_step=43, max_new=1024, lr=1e-3, beta=1e-3,
-                   v_hack_path="out/vhack/v_hack_full.safetensors"),
+                   n_problems=24, v_hack_path="out/vhack/v_hack_full.safetensors"),
 }
 
 

@@ -168,6 +168,17 @@ def _self_check() -> None:
         assert row["clean"] is False, f"grader={gm}: clean flagged exploited"
     logger.info("PASS: diagonal clean, off-diagonal and clean completions not exploited.")
 
+    # every problem's honest solution must pass the strict oracle -- catches a wrong
+    # body or gt_test the moment a problem is added/edited (the substrate's only gate).
+    counts = {m: 0 for m in MODES}
+    for p in PROBLEMS:
+        r = compute_reward(clean_completion(p), p)
+        assert r.gt_correct and not r.exploited, (
+            f"problem {p.id} ({p.method}, {p.mode}): clean gt_correct={r.gt_correct} "
+            f"exploited={r.exploited} -- wrong body or gt_tests")
+        counts[p.mode] += 1
+    logger.info(f"PASS: all {len(PROBLEMS)} clean solutions pass the oracle; per-mode {counts}.")
+
 
 if __name__ == "__main__":
     _self_check()
