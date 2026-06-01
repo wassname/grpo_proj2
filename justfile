@@ -20,17 +20,18 @@ check:
 build-pool:
     uv run python -m projected_grpo.build_pool --pool-dir=out/pools/teacher_pool
 
-# Smoke = the ONLY gate: same harness as production (train.py), tiny-random on CPU,
+# Smoke = the ONLY gate: same harness as production (train.py), tiny-random on GPU
+# in bf16 (same device+dtype as fast/full, so the cuda+bf16 path is actually covered).
 # beartype on so jaxtyping signatures get runtime-checked. 30 steps fires the
 # every-25-step save_ckpt path. erase writes g_proj; cache-miss extracts v_hack.
 smoke *ARGS: build-pool check
-    BEARTYPE=1 CUDA_VISIBLE_DEVICES= {{ TRAIN }} smoke --intervention=erase \
+    BEARTYPE=1 {{ TRAIN }} smoke --intervention=erase \
         --v-hack-path=out/vhack/v_hack_smoke.safetensors \
         --teacher-pool-dir=out/pools/teacher_pool --mix-ratio=0.5 {{ ARGS }}
 
 # Vanilla arm: V loaded for the measure_only diagnostic (cin), grad left untouched.
 smoke-vanilla *ARGS: build-pool
-    BEARTYPE=1 CUDA_VISIBLE_DEVICES= {{ TRAIN }} smoke --intervention=none \
+    BEARTYPE=1 {{ TRAIN }} smoke --intervention=none \
         --v-hack-path=out/vhack/v_hack_smoke.safetensors \
         --teacher-pool-dir=out/pools/teacher_pool --mix-ratio=0.5 {{ ARGS }}
 
@@ -38,7 +39,7 @@ smoke-vanilla *ARGS: build-pool
 # two-param optimizer path, periodic ablated-eval, online v_hack refresh + the
 # basis_overlap guard, and the final kept-vs-ablated BLUF.
 smoke-route *ARGS: build-pool
-    BEARTYPE=1 CUDA_VISIBLE_DEVICES= {{ TRAIN }} smoke --intervention=route \
+    BEARTYPE=1 {{ TRAIN }} smoke --intervention=route \
         --v-hack-path=out/vhack/v_hack_smoke.safetensors \
         --teacher-pool-dir=out/pools/teacher_pool --mix-ratio=0.5 \
         --eval-ablate-every=10 --eval-n-prompts=2 --vhack-refresh-every=10 {{ ARGS }}

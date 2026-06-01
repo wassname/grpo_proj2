@@ -28,8 +28,9 @@ from projected_grpo.problems import Pair, default_pairs
 
 def completion_nll(model, tok, prompt: str, completion: str) -> torch.Tensor:
     """Mean NLL on completion tokens only."""
+    dev = next(model.parameters()).device           # full feeds the cuda model; ids must follow
     p_ids = tok(prompt, return_tensors="pt").input_ids
-    full = tok(prompt + completion, return_tensors="pt").input_ids
+    full = tok(prompt + completion, return_tensors="pt").input_ids.to(dev)
     n_p = p_ids.shape[1]
     logp = per_token_logps(model(full).logits, full)        # (1, L-1)
     comp = logp[:, n_p - 1:]                                  # logp of completion tokens
@@ -56,7 +57,7 @@ def extract_v_hack(model, tok, wrappers: dict[str, Wrap], pairs: list[Pair],
         V = Vh_d[:k]                                                       # (k, r), rows orthonormal in ℝ^r
         # orient hack-ward by per-pair majority vote (outlier-robust; proj gates on ⟨g,v_i⟩>0)
         n_pairs = D.shape[0]
-        votes = torch.sign((D @ V.T > 0).sum(0).float() - n_pairs / 2)     # (k,)
+        votes = torch.sign((D.float() @ V.T > 0).sum(0).float() - n_pairs / 2)  # (k,); D bf16, V fp32 from svd
         votes[votes == 0] = 1.0
         V = V * votes[:, None]
         if τ_axis > 0:                                                     # zero noisy axes: S_i/S_0 < τ_axis

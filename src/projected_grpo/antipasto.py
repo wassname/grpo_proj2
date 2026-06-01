@@ -42,14 +42,17 @@ def svd_cached(W: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tenso
     """U Σ Vh = W, reduced. Cache key = sha256(W) so a stale cache is impossible
     (different W -> different file). Native dtype in, fp32 SVD, cast back."""
     SVD_CACHE.mkdir(exist_ok=True)
-    key = hashlib.sha256(W.detach().cpu().contiguous().numpy().tobytes()).hexdigest()
+    # .view(uint8) so the byte-hash is dtype-agnostic: numpy has no bf16, and every
+    # preset (smoke included, now) loads weights in bf16.
+    key = hashlib.sha256(W.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
     path = SVD_CACHE / f"{key}.safetensors"
     if path.exists():
-        t = load_file(path)
-        return t["U"].to(W.dtype), t["S"].to(W.dtype), t["Vh"].to(W.dtype)
+        t = load_file(path)                                  # .to(W): match W's device+dtype
+        return t["U"].to(W), t["S"].to(W), t["Vh"].to(W)     # (cache hit loads on cpu -> move to cuda)
     U, S, Vh = torch.linalg.svd(W.float(), full_matrices=False)
-    save_file({"U": U, "S": S, "Vh": Vh}, path)
-    return U.to(W.dtype), S.to(W.dtype), Vh.to(W.dtype)
+    # safetensors needs contiguous cpu tensors; svd outputs are neither on cuda.
+    save_file({"U": U.contiguous().cpu(), "S": S.contiguous().cpu(), "Vh": Vh.contiguous().cpu()}, path)
+    return U.to(W), S.to(W), Vh.to(W)
 
 
 def _δ_hook(lin: nn.Linear, x_in, y):
@@ -68,8 +71,9 @@ def wrap(model: nn.Module) -> dict[str, Wrap]:
         r = min(lin.in_features, lin.out_features)
         lin.register_buffer("U", U)
         lin.register_buffer("Vh", Vh)
-        lin.register_parameter("δS", nn.Parameter(torch.zeros(r, dtype=lin.weight.dtype)))
-        lin.register_parameter("δS_hack", nn.Parameter(torch.zeros(r, dtype=lin.weight.dtype)))
+        z = lambda: nn.Parameter(torch.zeros(r, dtype=lin.weight.dtype, device=lin.weight.device))
+        lin.register_parameter("δS", z())          # on the layer's device, else the hook mixes cpu/cuda
+        lin.register_parameter("δS_hack", z())
         lin.register_forward_hook(_δ_hook)
         wrappers[name] = Wrap(lin, r)
     for p in model.parameters():

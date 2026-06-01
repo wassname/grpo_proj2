@@ -7,7 +7,7 @@ Unbiased normalization: Dr.GRPO, Liu et al. 2025, arXiv:2503.20783 (drop the
   generate -> grade -> backward -> project -> step
 
 Arms (one knob): none -> measure_only | erase -> write g_proj | route -> +park δS_hack.
-Presets: smoke (tiny-random, CPU, the only gate) | fast | full.
+Presets: smoke (tiny-random, GPU bf16, the only gate) | fast | full.
 
   python -m projected_grpo.train smoke --intervention=erase ...
 """
@@ -105,7 +105,7 @@ class Config:
 
 
 PRESETS = {
-    "smoke": Config(),
+    "smoke": Config(device="cuda", dtype="bf16"),   # tiny-random on GPU: walks the real cuda+bf16 path
     "fast": Config(model="Qwen/Qwen3-4B", device="cuda", dtype="bf16", steps=60, group=8,
                    prompts_per_step=4, max_new=512, lr=3e-3, adam_beta1=0.5, adam_beta2=0.9,
                    mix_ratio=0.125, v_hack_path="out/vhack/v_hack_full.safetensors"),
@@ -162,6 +162,8 @@ def grpo_step(model, tok, wrappers, problem, pool_rows, G_s, G_t, cfg, pad_id, d
     m = dict(reward=R.mean().item(),
              hack_s=_mean([r.exploited for r in s_rew]), gt_s=_mean([r.gt_correct for r in s_rew]),
              hack_t=_mean([r["exploited"] for r in t_rows]), gt_t=_mean([r["gt_correct"] for r in t_rows]))
+    if s_rew:                                    # stash one student gen for the jsonl + the final coherence eyeball
+        m["gen"] = dict(text=texts[0], hack=s_rew[0].exploited, gt=s_rew[0].gt_correct, reward=s_rew[0].reward)
 
     empty = {n: torch.zeros_like(w.δS) for n, w in wrappers.items()}
     if R.max() - R.min() < 1e-6:                 # zero-variance group => adv≡0 => pure waste (bail)
@@ -256,6 +258,8 @@ def main(cfg: Config):
     V_raw, V_sv = resolve_or_extract(model, tok, wrappers, cfg.v_hack_path,
                                      cfg.vhack_pairs_path, cfg.v_hack_top_k, cfg.tau_axis, cfg.n_heldout)
     V_hack = postprocess_v_hack(V_raw, V_sv, cfg.v_hack_k, cfg.v_hack_drop_bottom_frac)
+    δS_ref = next(iter(wrappers.values())).δS              # V lives in δS's space: match dtype+device
+    V_hack = {n: V.to(δS_ref) for n, V in V_hack.items()}  # extract/load give fp32[/cpu]; grads are bf16 cuda
     logger.info(f"V_hack over {len(V_hack)} modules (k_use={cfg.v_hack_k}); "
                 f"arm={cfg.intervention} -> measure_only={cfg.intervention == 'none'}")
 
@@ -311,6 +315,8 @@ def main(cfg: Config):
                    reward=_mean([m["reward"] for m in ms]), loss=_mean([m.get("loss", 0.0) for m in ms]),
                    gn=gn.item(), cin_s=cin_s, cin_t=cin_t, cin=cin, cout=cout, fired=fired,
                    dSh=dSh)
+        if "gen" in ms[0]:                       # log the first prompt's first student gen (text + flags)
+            row["gen"] = ms[0]["gen"]
 
         # online refresh: re-extract V against the CURRENT model (under quarantine ablation)
         if cfg.vhack_refresh_every and V_hack and step % cfg.vhack_refresh_every == 0:
@@ -319,6 +325,7 @@ def main(cfg: Config):
                 V_raw, V_sv = extract_v_hack(model, tok, wrappers, default_pairs(),
                                              cfg.v_hack_top_k, cfg.tau_axis, cfg.n_heldout)
             V_hack = postprocess_v_hack(V_raw, V_sv, cfg.v_hack_k, cfg.v_hack_drop_bottom_frac)
+            V_hack = {n: V.to(δS_ref) for n, V in V_hack.items()}   # keep V in δS's bf16/cuda space
             shared = [n for n in V_hack if n in old]
             ov = _mean([abs((V_hack[n][0] @ old[n][0]).item()) for n in shared]) if shared else 0.0
             row["basis_overlap"] = ov            # GUARD: should sit near 1.0; <~0.2 => refresh rotated off-hack
@@ -333,7 +340,8 @@ def main(cfg: Config):
         rows.append(row)
         log.write(json.dumps(row) + "\n"); log.flush()
         pbar.set_postfix(hack_s=f"{row['hack_s']:.2f}", cin_s=f"{cin_s:.2f}", cin_t=f"{cin_t:.2f}",
-                         cout=f"{cout:.2f}", δSh=f"{dSh:.2f}", loss=f"{row['loss']:.3f}")
+                         cout=f"{cout:.2f}", δSh=f"{dSh:.2f}", loss=f"{row['loss']:.3f}",
+                         refresh=False)  # don't force a bar redraw every step (pollutes piped logs)
         if step % 25 == 0:
             save_ckpt(wrappers, rows, cfg.out_tag or f"_{cfg.intervention}_s{cfg.seed}")
 
@@ -370,6 +378,13 @@ def _bluf(cfg, rows, wrappers, model, tok, problems, pad_id):
                "overlap with V (relu-before-agg), cout→0 residual hack-ward leak (identity under "
                "one_sided, not efficacy), |δSh| quarantine norm (>0 iff route).")
     logger.info(f"out: {out}")
+    # Last student generation -- a coherence eyeball before the numbers. SHOULD: real
+    # code/prose for the problem. If it is token salad the policy diverged and the eval
+    # numbers below are moot. (Empty on tiny-random if no student rollout was graded.)
+    last_gen = next((r["gen"] for r in reversed(rows) if r.get("gen")), None)
+    if last_gen:
+        logger.info(f"last student gen (hack={last_gen['hack']} gt={last_gen['gt']} "
+                    f"reward={last_gen['reward']:.2f}):\n{last_gen['text']}")
     logger.info(f"main metric: {cue} hack_s={hack:.3f} solve={solve:.3f} cin_t={cin_t:.3f} cout={cout:.3f} "
                 f"[arm={cfg.intervention},seed={cfg.seed},steps={len(rows)}]")
     print(f"\n{caption}\n")
