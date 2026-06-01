@@ -1,87 +1,76 @@
-"""SVD-basis adapter (pseudocode 01). Prior work: github.com/wassname/AntiPaSTO.
+"""Parametrized-LoRA adapter (pseudocode 01).
 
-Train ONE per-module knob δS in the singular-value basis of each Linear. The
-extracted hack direction V, the live gradient, and the projection all live in
-these same low-rank weight-aligned coordinates (ℝ^r). At δS=δS_hack=0 the adapter
-is bit-identical to the base model (W is never reconstructed on the main path),
-so a no_grad forward with the knobs zeroed gives π_ref for free -- no 2nd model.
+Per target Linear, freeze a random projection A ∈ ℝ^{r×d_in} and train B ∈ ℝ^{d_out×r}
+(plus a same-shape quarantine B_hack for the route arm). The added weight is
+
+    δW = (B + B_hack) · A          # applied as  y += (A x) @ (B+B_hack)ᵀ
+
+which is LINEAR in the trained knob B: ∂δW/∂B is the constant A. That is the one
+property the gradient projection needs -- a hack direction V extracted once stays a
+fixed weight-space direction, so we can project it out every step without re-deriving
+it (cf. proj.py). At B=B_hack=0 the adapter is identity (W is never touched), so a
+no_grad forward with the knobs zeroed is π_ref for free -- no 2nd model. B_hack has the
+SAME shape as B, so the quarantine is capacity-matched (it cannot become a sink).
+
+A is frozen and random (not the SVD basis): showing the projection works in an
+arbitrary fixed basis is stronger than an SVD-aligned one, and it drops the whole
+per-module SVD subsystem.
 """
 from __future__ import annotations
 
-import hashlib
 from contextlib import contextmanager
 from dataclasses import dataclass
-from pathlib import Path
 
 import torch
 import torch.nn as nn
 from loguru import logger
-from safetensors.torch import load_file, save_file
 
 TARGET = {"q_proj", "k_proj", "v_proj", "o_proj",
           "in_proj_qkv", "in_proj_z", "in_proj_a", "in_proj_b", "out_proj",   # GatedDeltaNet
           "up_proj", "gate_proj", "down_proj"}
-SVD_CACHE = Path("svd_cache")
 
 
 @dataclass
 class Wrap:
-    layer: nn.Linear   # carries .U, .Vh buffers and .δS, .δS_hack params
+    layer: nn.Linear   # carries frozen .A buffer and trained .B, .B_hack params
     r: int
 
     @property
-    def δS(self) -> nn.Parameter:
-        return self.layer.δS
+    def B(self) -> nn.Parameter:
+        return self.layer.B
 
     @property
-    def δS_hack(self) -> nn.Parameter:
-        return self.layer.δS_hack
+    def B_hack(self) -> nn.Parameter:
+        return self.layer.B_hack
 
 
-def svd_cached(W: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """U Σ Vh = W, reduced. Cache key = sha256(W) so a stale cache is impossible
-    (different W -> different file). Native dtype in, fp32 SVD, cast back."""
-    SVD_CACHE.mkdir(exist_ok=True)
-    # .view(uint8) so the byte-hash is dtype-agnostic: numpy has no bf16, and every
-    # preset (smoke included, now) loads weights in bf16.
-    key = hashlib.sha256(W.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()).hexdigest()
-    path = SVD_CACHE / f"{key}.safetensors"
-    if path.exists():
-        t = load_file(path)                                  # .to(W): match W's device+dtype
-        return t["U"].to(W), t["S"].to(W), t["Vh"].to(W)     # (cache hit loads on cpu -> move to cuda)
-    U, S, Vh = torch.linalg.svd(W.float(), full_matrices=False)
-    # safetensors needs contiguous cpu tensors; svd outputs are neither on cuda.
-    save_file({"U": U.contiguous().cpu(), "S": S.contiguous().cpu(), "Vh": Vh.contiguous().cpu()}, path)
-    return U.to(W), S.to(W), Vh.to(W)
+def _lora_hook(lin: nn.Linear, x_in, y):
+    x = x_in[0]                                  # (..., d_in)
+    h = x @ lin.A.T                              # (..., r)   into the fixed random subspace
+    return y + h @ (lin.B + lin.B_hack).T        # (..., d_out)   B=B_hack=0 -> identity
 
 
-def _δ_hook(lin: nn.Linear, x_in, y):
-    x = x_in[0]                              # (..., d_in)
-    h = x @ lin.Vh.T                         # (..., r)   into singular basis
-    h = h * (lin.δS + lin.δS_hack)           # scale per singular axis (forward uses the SUM)
-    return y + h @ lin.U.T                   # (..., d_out)   δS+δS_hack=0 -> identity
-
-
-def wrap(model: nn.Module) -> dict[str, Wrap]:
+def wrap(model: nn.Module, r: int = 32) -> dict[str, Wrap]:
     wrappers: dict[str, Wrap] = {}
     for name, lin in model.named_modules():
         if not isinstance(lin, nn.Linear) or name.split(".")[-1] not in TARGET:
             continue
-        U, _Σ, Vh = svd_cached(lin.weight)              # W ∈ ℝ^{d_out×d_in}
-        r = min(lin.in_features, lin.out_features)
-        lin.register_buffer("U", U)
-        lin.register_buffer("Vh", Vh)
-        z = lambda: nn.Parameter(torch.zeros(r, dtype=lin.weight.dtype, device=lin.weight.device))
-        lin.register_parameter("δS", z())          # on the layer's device, else the hook mixes cpu/cuda
-        lin.register_parameter("δS_hack", z())
-        lin.register_forward_hook(_δ_hook)
-        wrappers[name] = Wrap(lin, r)
+        d_out, d_in = lin.out_features, lin.in_features
+        rk = min(r, d_in)                        # need rk ≤ d_in for orthonormal rows of A
+        A = torch.empty(rk, d_in, dtype=torch.float32, device=lin.weight.device)
+        nn.init.orthogonal_(A)                   # A Aᵀ = I_rk; QR (geqrf) needs fp32, cast after
+        lin.register_buffer("A", A.to(lin.weight.dtype))  # frozen bf16 buffer for the forward matmul
+        zeros = lambda: nn.Parameter(torch.zeros(d_out, rk, dtype=lin.weight.dtype, device=lin.weight.device))
+        lin.register_parameter("B", zeros())     # zero-init -> δW=0 at start (π_ref) and ∇B≠0 (A≠0)
+        lin.register_parameter("B_hack", zeros())
+        lin.register_forward_hook(_lora_hook)
+        wrappers[name] = Wrap(lin, rk)
     for p in model.parameters():
-        p.requires_grad_(False)
+        p.requires_grad_(False)                  # freeze base; A is a buffer so already frozen
     for w in wrappers.values():
-        w.δS.requires_grad_(True)
-        w.δS_hack.requires_grad_(True)
-    logger.info(f"wrapped {len(wrappers)} Linears with δS knobs (r in "
+        w.B.requires_grad_(True)
+        w.B_hack.requires_grad_(True)
+    logger.info(f"wrapped {len(wrappers)} Linears with LoRA knobs (r in "
                 f"[{min(w.r for w in wrappers.values())}, {max(w.r for w in wrappers.values())}])")
     return wrappers
 
@@ -89,29 +78,29 @@ def wrap(model: nn.Module) -> dict[str, Wrap]:
 @contextmanager
 def zeroed(wrappers: dict[str, Wrap]):
     """Both knobs -> 0 (free reference model). Restores on exit."""
-    saved = [(w.δS.data.clone(), w.δS_hack.data.clone()) for w in wrappers.values()]
+    saved = [(w.B.data.clone(), w.B_hack.data.clone()) for w in wrappers.values()]
     for w in wrappers.values():
-        w.δS.data.zero_()
-        w.δS_hack.data.zero_()
+        w.B.data.zero_()
+        w.B_hack.data.zero_()
     try:
         yield
     finally:
-        for w, (s, sh) in zip(wrappers.values(), saved):
-            w.δS.data.copy_(s)
-            w.δS_hack.data.copy_(sh)
+        for w, (b, bh) in zip(wrappers.values(), saved):
+            w.B.data.copy_(b)
+            w.B_hack.data.copy_(bh)
 
 
 @contextmanager
 def ablate_quarantine(wrappers: dict[str, Wrap]):
-    """δS_hack -> 0 only (deploy-time ablation / extraction). No-op for erase (δS_hack stays 0)."""
-    saved = [w.δS_hack.data.clone() for w in wrappers.values()]
+    """B_hack -> 0 only (deploy-time ablation / extraction). No-op for erase (B_hack stays 0)."""
+    saved = [w.B_hack.data.clone() for w in wrappers.values()]
     for w in wrappers.values():
-        w.δS_hack.data.zero_()
+        w.B_hack.data.zero_()
     try:
         yield
     finally:
-        for w, sh in zip(wrappers.values(), saved):
-            w.δS_hack.data.copy_(sh)
+        for w, bh in zip(wrappers.values(), saved):
+            w.B_hack.data.copy_(bh)
 
 
 def per_token_logps(logits: torch.Tensor, ids: torch.Tensor) -> torch.Tensor:

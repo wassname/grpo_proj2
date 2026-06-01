@@ -6,7 +6,7 @@ Unbiased normalization: Dr.GRPO, Liu et al. 2025, arXiv:2503.20783 (drop the
 
   generate -> grade -> backward -> project -> step
 
-Arms (one knob): none -> measure_only | erase -> write g_proj | route -> +park δS_hack.
+Arms (one knob): none -> measure_only | erase -> write g_proj | route -> +park B_hack.
 Presets: smoke (tiny-random, GPU bf16, the only gate) | fast | full.
 
   python -m projected_grpo.train smoke --intervention=erase ...
@@ -73,7 +73,8 @@ class Config:
     n_problems: int = 6
     env_mode: Optional[EnvMode] = None     # force a single mode (emergence cells)
     mix_ratio: float = 0.5                 # G_t / G  (teacher fraction)
-    teacher_pool_dir: str = ""
+    teacher_pool_dir: str = "out/pools/teacher_pool"
+    lora_rank: int = 32                    # r: A is (r×d_in) frozen, B is (d_out×r) trained
     # optim
     lr: float = 1e-2
     adam_beta1: float = 0.9
@@ -82,7 +83,7 @@ class Config:
     warmup_frac: float = 0.1
     grad_clip: float = 10.0
     # GRPO
-    beta: float = 0.0                      # KL to free ref (δS=0); 0 = off
+    beta: float = 0.0                      # KL to free ref (B=0); 0 = off
     clip: float = 0.2
     # projection
     gate_mode: str = "one_sided"
@@ -130,7 +131,7 @@ def load_pool(pool_dir: str) -> dict[str, list[dict]]:
 
 # ── inner GRPO step on one prompt ─────────────────────────────────────────────
 def grpo_step(model, tok, wrappers, problem, pool_rows, G_s, G_t, cfg, pad_id, denom):
-    """Returns (g_s, g_t, metrics) for this prompt; δS.grad left holding g_s+g_t.
+    """Returns (g_s, g_t, metrics) for this prompt; B.grad left holding g_s+g_t.
     g_s/g_t are per-module dicts so the outer loop can accumulate + diagnose cin."""
     prompt_ids = tok(problem.prompt(), return_tensors="pt").input_ids.to(cfg.device)
     P = prompt_ids.shape[1]
@@ -165,7 +166,7 @@ def grpo_step(model, tok, wrappers, problem, pool_rows, G_s, G_t, cfg, pad_id, d
     if s_rew:                                    # stash one student gen for the jsonl + the final coherence eyeball
         m["gen"] = dict(text=texts[0], hack=s_rew[0].exploited, gt=s_rew[0].gt_correct, reward=s_rew[0].reward)
 
-    empty = {n: torch.zeros_like(w.δS) for n, w in wrappers.items()}
+    empty = {n: torch.zeros_like(w.B) for n, w in wrappers.items()}
     if R.max() - R.min() < 1e-6:                 # zero-variance group => adv≡0 => pure waste (bail)
         return empty, dict(empty), m
 
@@ -193,15 +194,15 @@ def grpo_step(model, tok, wrappers, problem, pool_rows, G_s, G_t, cfg, pad_id, d
     is_s = torch.tensor(is_student, dtype=torch.float32, device=cfg.device)[:, None]
 
     # split student/teacher grads. zero+clone BETWEEN passes is load-bearing: after
-    # L_t.backward, δS.grad already holds g_s+g_t (accumulation), so reset first.
+    # L_t.backward, B.grad already holds g_s+g_t (accumulation), so reset first.
     model.zero_grad()
     L_s = (Lp * comp_mask * is_s).sum() / denom
     L_s.backward(retain_graph=True)
-    g_s = {n: w.δS.grad.detach().clone() for n, w in wrappers.items()}
+    g_s = {n: w.B.grad.detach().clone() for n, w in wrappers.items()}
     model.zero_grad()
     L_t = (Lp * comp_mask * (1 - is_s)).sum() / denom
     L_t.backward()
-    g_t = {n: w.δS.grad.detach().clone() for n, w in wrappers.items()}
+    g_t = {n: w.B.grad.detach().clone() for n, w in wrappers.items()}
     m["loss"] = (L_s + L_t).item()
     return g_s, g_t, m
 
@@ -226,8 +227,8 @@ def save_ckpt(wrappers, rows, tag):
     Path("out/ckpt").mkdir(parents=True, exist_ok=True)
     flat = {}
     for n, w in wrappers.items():
-        flat[f"δS/{n}"] = w.δS.detach().cpu()
-        flat[f"δS_hack/{n}"] = w.δS_hack.detach().cpu()
+        flat[f"B/{n}"] = w.B.detach().cpu()
+        flat[f"B_hack/{n}"] = w.B_hack.detach().cpu()
     save_file(flat, f"out/ckpt/ckpt{tag}.safetensors")
     Path(f"out/ckpt/rows{tag}.json").write_text(json.dumps(rows))
 
@@ -246,9 +247,11 @@ def main(cfg: Config):
     pad_id = tok.pad_token_id if tok.pad_token_id is not None else tok.eos_token_id
     model = AutoModelForCausalLM.from_pretrained(cfg.model, dtype=dt).to(cfg.device)
     model.eval()
-    wrappers = wrap(model)
+    wrappers = wrap(model, cfg.lora_rank)
+    n_train = sum(w.B.numel() for w in wrappers.values())
+    logger.info(f"trainable B: {n_train:,} (+{n_train:,} B_hack quarantine), lora_rank={cfg.lora_rank}")
 
-    params = [w.δS for w in wrappers.values()] + [w.δS_hack for w in wrappers.values()]
+    params = [w.B for w in wrappers.values()] + [w.B_hack for w in wrappers.values()]
     opt = torch.optim.AdamW(params, lr=cfg.lr, betas=(cfg.adam_beta1, cfg.adam_beta2),
                             weight_decay=cfg.weight_decay)
     sched = get_cosine_schedule_with_warmup(opt, int(cfg.warmup_frac * cfg.steps), cfg.steps)
@@ -258,8 +261,8 @@ def main(cfg: Config):
     V_raw, V_sv = resolve_or_extract(model, tok, wrappers, cfg.v_hack_path,
                                      cfg.vhack_pairs_path, cfg.v_hack_top_k, cfg.tau_axis, cfg.n_heldout)
     V_hack = postprocess_v_hack(V_raw, V_sv, cfg.v_hack_k, cfg.v_hack_drop_bottom_frac)
-    δS_ref = next(iter(wrappers.values())).δS              # V lives in δS's space: match dtype+device
-    V_hack = {n: V.to(δS_ref) for n, V in V_hack.items()}  # extract/load give fp32[/cpu]; grads are bf16 cuda
+    B_ref = next(iter(wrappers.values())).B                # V lives in B's space: match dtype+device
+    V_hack = {n: V.to(B_ref) for n, V in V_hack.items()}   # extract/load give fp32[/cpu]; grads are bf16 cuda
     logger.info(f"V_hack over {len(V_hack)} modules (k_use={cfg.v_hack_k}); "
                 f"arm={cfg.intervention} -> measure_only={cfg.intervention == 'none'}")
 
@@ -275,17 +278,21 @@ def main(cfg: Config):
     log = logname.open("w")
     rows = []
 
+    # per-step table: one logger.info row/step (legend once). SHORT runs (20-200 steps),
+    # so a row/step reads cleanly -- no tqdm bar (it redraws into piped logs).
     logger.info(
-        "SHOULD (per-step JSONL rows + tqdm postfix): erase/route cin_t>0 and >cin_s early "
-        "(teacher pool carries the hack signal), decaying as V goes stale; cout~0 under one_sided "
-        "is an arithmetic identity, NOT efficacy; |δSh|>0 iff route, else 0; hack_s stays 0 on "
-        "tiny-random (mechanics smoke). If cin_t~0 throughout -> V missed the live GRPO gradient.")
-    pbar = tqdm(range(cfg.steps), desc=f"train[{cfg.intervention}] s{cfg.seed}",
-                mininterval=120, maxinterval=120)
-    for step in pbar:
+        "per-step columns:  step | rew=mean reward | gt_s=student solve | hack_s=student exploit (HEADLINE) |"
+        " hack_t=teacher exploit (pool sanity) | cin_s/cin_t=student/teacher grad overlap with V (relu-agg) |"
+        " cout=residual hack-ward leak | loss | gn=pre-clip grad L2 | lr | |Bh|=quarantine norm.\n"
+        "SHOULD: cin_t>cin_s early (teacher carries the hack signal), decaying as V stales; cout~0 under "
+        "one_sided is an ARITHMETIC IDENTITY not efficacy; |Bh|>0 iff route; hack_s stays 0 on tiny-random.")
+    hdr = (f"{'step':>4} {'rew':>6} {'gt_s':>5} {'hack_s':>6} {'hack_t':>6} {'cin_s':>6} {'cin_t':>6} "
+           f"{'cout':>6} {'loss':>7} {'gn':>8} {'lr':>8} {'|Bh|':>8}")
+    logger.info(hdr)
+    for step in range(cfg.steps):
         opt.zero_grad()
-        g_s_acc = {n: torch.zeros_like(w.δS) for n, w in wrappers.items()}
-        g_t_acc = {n: torch.zeros_like(w.δS) for n, w in wrappers.items()}
+        g_s_acc = {n: torch.zeros_like(w.B) for n, w in wrappers.items()}
+        g_t_acc = {n: torch.zeros_like(w.B) for n, w in wrappers.items()}
         ms = []
         for _ in range(cfg.prompts_per_step):
             prob = problems[random.randrange(len(problems))]
@@ -295,8 +302,8 @@ def main(cfg: Config):
                 g_s_acc[n] += g_s[n]; g_t_acc[n] += g_t[n]
             ms.append(m)
         for n, w in wrappers.items():
-            w.δS.grad = g_s_acc[n] + g_t_acc[n]   # combined live GRPO gradient on the knob
-            w.δS_hack.grad = None                 # quarantine moves ONLY via routed `removed` (set in project_all)
+            w.B.grad = g_s_acc[n] + g_t_acc[n]    # combined live GRPO gradient on the knob
+            w.B_hack.grad = None                  # quarantine moves ONLY via routed `removed` (set in project_all)
 
         cin_s = cos_overlap(g_s_acc, V_hack) if V_hack else 0.0
         cin_t = cos_overlap(g_t_acc, V_hack) if V_hack else 0.0
@@ -309,12 +316,12 @@ def main(cfg: Config):
         gn = torch.nn.utils.clip_grad_norm_([p for p in params if p.grad is not None], cfg.grad_clip)
         opt.step(); sched.step()
 
-        dSh = sum(w.δS_hack.detach().norm().item() for w in wrappers.values())
+        bh = sum(w.B_hack.detach().norm().item() for w in wrappers.values())
         row = dict(step=step, hack_s=_mean([m["hack_s"] for m in ms]), gt_s=_mean([m["gt_s"] for m in ms]),
                    hack_t=_mean([m["hack_t"] for m in ms]), gt_t=_mean([m["gt_t"] for m in ms]),
                    reward=_mean([m["reward"] for m in ms]), loss=_mean([m.get("loss", 0.0) for m in ms]),
                    gn=gn.item(), cin_s=cin_s, cin_t=cin_t, cin=cin, cout=cout, fired=fired,
-                   dSh=dSh)
+                   bh=bh)
         if "gen" in ms[0]:                       # log the first prompt's first student gen (text + flags)
             row["gen"] = ms[0]["gen"]
 
@@ -325,12 +332,12 @@ def main(cfg: Config):
                 V_raw, V_sv = extract_v_hack(model, tok, wrappers, default_pairs(),
                                              cfg.v_hack_top_k, cfg.tau_axis, cfg.n_heldout)
             V_hack = postprocess_v_hack(V_raw, V_sv, cfg.v_hack_k, cfg.v_hack_drop_bottom_frac)
-            V_hack = {n: V.to(δS_ref) for n, V in V_hack.items()}   # keep V in δS's bf16/cuda space
+            V_hack = {n: V.to(B_ref) for n, V in V_hack.items()}    # keep V in B's bf16/cuda space
             shared = [n for n in V_hack if n in old]
             ov = _mean([abs((V_hack[n][0] @ old[n][0]).item()) for n in shared]) if shared else 0.0
             row["basis_overlap"] = ov            # GUARD: should sit near 1.0; <~0.2 => refresh rotated off-hack
 
-        # deployment-time eval (route only): zero δS_hack, eval the ablated model
+        # deployment-time eval (route only): zero B_hack, eval the ablated model
         if is_route and cfg.eval_ablate_every and step % cfg.eval_ablate_every == 0:
             with ablate_quarantine(wrappers):
                 hd, sd = eval_hack_solve(model, tok, wrappers, problems, cfg.eval_n_prompts,
@@ -339,9 +346,10 @@ def main(cfg: Config):
 
         rows.append(row)
         log.write(json.dumps(row) + "\n"); log.flush()
-        pbar.set_postfix(hack_s=f"{row['hack_s']:.2f}", cin_s=f"{cin_s:.2f}", cin_t=f"{cin_t:.2f}",
-                         cout=f"{cout:.2f}", δSh=f"{dSh:.2f}", loss=f"{row['loss']:.3f}",
-                         refresh=False)  # don't force a bar redraw every step (pollutes piped logs)
+        lr = sched.get_last_lr()[0]
+        logger.info(f"{step:4d} {row['reward']:+6.2f} {row['gt_s']:5.2f} {row['hack_s']:6.2f} "
+                    f"{row['hack_t']:6.2f} {cin_s:6.3f} {cin_t:6.3f} {cout:6.3f} {row['loss']:+7.3f} "
+                    f"{gn.item():8.1e} {lr:8.1e} {bh:8.3f}")
         if step % 25 == 0:
             save_ckpt(wrappers, rows, cfg.out_tag or f"_{cfg.intervention}_s{cfg.seed}")
 
@@ -356,14 +364,14 @@ def _bluf(cfg, rows, wrappers, model, tok, problems, pad_id):
     last5 = rows[-5:]
     hack = _mean([r["hack_s"] for r in last5]); solve = _mean([r["gt_s"] for r in last5])
     cin_t = _mean([r["cin_t"] for r in last5]); cout = _mean([r["cout"] for r in last5])
-    dSh = rows[-1]["dSh"]
+    bh = rows[-1]["bh"]
     out = f"logs/run_{cfg.intervention}{cfg.out_tag}_s{cfg.seed}.log"
     # mechanics cue: projection arms want the teacher hack signal present (cin_t>0); none is neutral
     cue = "\U0001F7E2" if (cfg.intervention == "none" or cin_t > 0) else "\U0001F534"
 
     summary = {"arm": cfg.intervention, "steps": len(rows),
                "hack↓": round(hack, 3), "solve→": round(solve, 3),
-               "cin_t↑": round(cin_t, 3), "cout→0": round(cout, 3), "|δSh|": round(dSh, 2)}
+               "cin_t↑": round(cin_t, 3), "cout→0": round(cout, 3), "|Bh|": round(bh, 2)}
     if cfg.intervention == "route":
         with ablate_quarantine(wrappers):
             hk_abl, sv_abl = eval_hack_solve(model, tok, wrappers, problems, cfg.eval_n_prompts or 2,
@@ -376,7 +384,7 @@ def _bluf(cfg, rows, wrappers, model, tok, problems, pad_id):
     caption = (f"Table: last-5-step means, arm={cfg.intervention} seed={cfg.seed}. "
                "hack↓ student exploit rate, solve→ gt-correct rate, cin_t↑ teacher-grad "
                "overlap with V (relu-before-agg), cout→0 residual hack-ward leak (identity under "
-               "one_sided, not efficacy), |δSh| quarantine norm (>0 iff route).")
+               "one_sided, not efficacy), |Bh| quarantine norm (>0 iff route).")
     logger.info(f"out: {out}")
     # Last student generation -- a coherence eyeball before the numbers. SHOULD: real
     # code/prose for the problem. If it is token salad the policy diverged and the eval

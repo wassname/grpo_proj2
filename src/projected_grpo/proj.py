@@ -1,6 +1,6 @@
 """Gradient projection: erase / route the hack component (pseudocode 03).
 
-Once per optimizer step, after δS.grad is populated, before opt.step(). The bet:
+Once per optimizer step, after B.grad is populated, before opt.step(). The bet:
 subtract the hack-ward component of the live GRPO gradient (basis V from labeled
 pairs) so the model descends what's left and cannot move hack-ward even when the
 reward rewards it.
@@ -40,20 +40,21 @@ def project_one(g: Float[Tensor, "r"], V: Float[Tensor, "k r"],
 def project_all(wrappers, V_hack, measure_only: bool, route: bool,
                 gate_mode: str = "one_sided", overshoot: float = 1.0,
                 preserve_magnitude: bool = False):
-    """arms: none -> measure_only | erase -> write g_proj | route -> erase + park in δS_hack."""
+    """arms: none -> measure_only | erase -> write g_proj | route -> erase + park in B_hack.
+    The knob B is (d_out, r); project_one is dim-agnostic so we flatten to ℝ^{d_out·r}."""
     cins, couts, fired = [], [], 0
     for name, w in wrappers.items():
         if name not in V_hack:                  # below noise floor -> no hack signal -> skip
             continue
-        g_proj, removed, cin, cout = project_one(
-            w.δS.grad, V_hack[name], gate_mode, preserve_magnitude, overshoot)
+        g = w.B.grad.reshape(-1)                # (d_out·r,)  V_hack[name] is (k, d_out·r)
+        g_proj, removed, cin, cout = project_one(g, V_hack[name], gate_mode, preserve_magnitude, overshoot)
         cins.append(cin); couts.append(cout)
         fired += int(cin > 1e-6)
         if measure_only:                        # vanilla: measure cin/cout, leave g
             continue
-        w.δS.grad = g_proj                       # erase: descend the hack-free gradient
+        w.B.grad = g_proj.reshape_as(w.B.grad)  # erase: descend the hack-free gradient
         if route:
-            w.δS_hack.grad = removed             # park hack part in deletable knob (Cloud 2024)
+            w.B_hack.grad = removed.reshape_as(w.B_hack)  # park hack part in deletable knob (Cloud 2024)
     n = max(len(cins), 1)
     mean = lambda xs: torch.stack(xs).mean().item() if xs else 0.0
     return mean(cins), mean(couts), fired / n
@@ -65,5 +66,6 @@ def cos_overlap(grads: dict, V_hack) -> float:
     for name, g in grads.items():
         if name not in V_hack or g is None:
             continue
+        g = g.reshape(-1)                       # B-grad (d_out, r) -> ℝ^{d_out·r}
         cs.append(torch.relu(V_hack[name] @ g).norm() / g.norm().clamp_min(1e-12))
     return torch.stack(cs).mean().item() if cs else 0.0

@@ -1,4 +1,4 @@
-"""Aggregate logs/*.log (JSONL rows from train.py) into a last-5-step table.
+"""Aggregate logs/run_*.log (JSONL rows from train.py) into a last-5-step table.
 
 hack = student exploited rate (hack_s); solve = student gt_correct rate (gt_s).
 Each row is one run; the arm/seed come from the filename run_{arm}_s{seed}.log.
@@ -18,7 +18,7 @@ def last5(rows, key):
     return sum(vals) / len(vals) if vals else float("nan")
 
 
-def main(pattern: str = "logs/*.log") -> None:
+def main(pattern: str = "logs/run_*.log") -> None:
     table = []
     for path in sorted(glob.glob(pattern)):
         rows = [json.loads(l) for l in open(path) if l.strip()]
@@ -35,4 +35,4 @@ def main(pattern: str = "logs/*.log") -> None:
 
 
 if __name__ == "__main__":
-    main(sys.argv[1] if len(sys.argv) > 1 else "logs/*.log")
+    main(sys.argv[1] if len(sys.argv) > 1 else "logs/run_*.log")

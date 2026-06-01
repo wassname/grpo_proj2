@@ -22,33 +22,20 @@ build-pool:
 
 # Smoke = the ONLY gate: same harness as production (train.py), tiny-random on GPU
 # in bf16 (same device+dtype as fast/full, so the cuda+bf16 path is actually covered).
-# beartype on so jaxtyping signatures get runtime-checked. 30 steps fires the
-# every-25-step save_ckpt path. erase writes g_proj; cache-miss extracts v_hack.
+# beartype on so jaxtyping signatures get runtime-checked. Arm/v_hack/pool/mix come
+# from the smoke preset, so the only override you usually pass is --intervention.
 smoke *ARGS: build-pool check
-    BEARTYPE=1 {{ TRAIN }} smoke --intervention=erase \
-        --v-hack-path=out/vhack/v_hack_smoke.safetensors \
-        --teacher-pool-dir=out/pools/teacher_pool --mix-ratio=0.5 {{ ARGS }}
+    BEARTYPE=1 {{ TRAIN }} smoke {{ ARGS }}
 
-# Vanilla arm: V loaded for the measure_only diagnostic (cin), grad left untouched.
-smoke-vanilla *ARGS: build-pool
-    BEARTYPE=1 {{ TRAIN }} smoke --intervention=none \
-        --v-hack-path=out/vhack/v_hack_smoke.safetensors \
-        --teacher-pool-dir=out/pools/teacher_pool --mix-ratio=0.5 {{ ARGS }}
+# Every code path the real run walks: erase (gate) + vanilla (measure_only cin) +
+# route (two-knob optim, ablated deploy-eval, online v_hack refresh + basis_overlap).
+smoke-all: build-pool check
+    BEARTYPE=1 {{ TRAIN }} smoke --intervention=erase
+    BEARTYPE=1 {{ TRAIN }} smoke --intervention=none
+    BEARTYPE=1 {{ TRAIN }} smoke --intervention=route --eval-ablate-every=10 --eval-n-prompts=2 --vhack-refresh-every=10
+    just results
 
-# Routing arm: parks the hack-ward grad in δS_hack, ablates at eval. Fires the
-# two-param optimizer path, periodic ablated-eval, online v_hack refresh + the
-# basis_overlap guard, and the final kept-vs-ablated BLUF.
-smoke-route *ARGS: build-pool
-    BEARTYPE=1 {{ TRAIN }} smoke --intervention=route \
-        --v-hack-path=out/vhack/v_hack_smoke.safetensors \
-        --teacher-pool-dir=out/pools/teacher_pool --mix-ratio=0.5 \
-        --eval-ablate-every=10 --eval-n-prompts=2 --vhack-refresh-every=10 {{ ARGS }}
-
-# The trio = every code path the full run walks. Run before any real run.
-smoke-all: smoke smoke-vanilla smoke-route results
-
-# Run smoke twice: first warms the v_hack cache (miss), second hits it (cache-hit
-# branch). Catches save/scope bugs that only manifest in one.
+# Run smoke twice: cache MISS (extract v_hack) then HIT. Catches save/scope bugs.
 smoke-both:
     rm -f out/vhack/v_hack_smoke.safetensors
     just smoke
@@ -58,15 +45,17 @@ smoke-both:
 results:
     uv run python scripts/results.py
 
-# Real runs (Qwen3-4B, GPU). v_hack auto-extracts on cache-miss inside train.
-full-vanilla *ARGS:
-    {{ TRAIN }} full --intervention=none {{ ARGS }}
+# Real runs (Qwen3-4B, GPU). intervention defaults to erase; pass --intervention=none
+# for vanilla. v_hack auto-extracts on cache-miss inside train.
+fast *ARGS:
+    {{ TRAIN }} fast {{ ARGS }}
 
 full *ARGS:
-    {{ TRAIN }} full --intervention=erase {{ ARGS }}
+    {{ TRAIN }} full {{ ARGS }}
 
-fast-vanilla *ARGS:
-    {{ TRAIN }} fast --intervention=none --teacher-pool-dir=out/pools/teacher_pool {{ ARGS }}
-
-fast *ARGS:
-    {{ TRAIN }} fast --intervention=erase --teacher-pool-dir=out/pools/teacher_pool {{ ARGS }}
+# Fire the matched arm comparison as low-priority pueue jobs (vanilla | erase | route)
+# for one PRESET/SEED/STEPS. One entrypoint queues the cell; pueue persists the logs.
+sweep PRESET='fast' SEED='41' STEPS='60':
+    pueue add -w "$PWD" -o=-8 -l "why: {{ PRESET }} vanilla s{{ SEED }} x{{ STEPS }}; resolve: hack_s onset baseline (extracts v_hack)" -- {{ TRAIN }} {{ PRESET }} --intervention=none --seed={{ SEED }} --steps={{ STEPS }} --out-tag=_sweep
+    pueue add -w "$PWD" -o=-8 -l "why: {{ PRESET }} erase s{{ SEED }} x{{ STEPS }}; resolve: hack_s suppressed vs vanilla at matched solve" -- {{ TRAIN }} {{ PRESET }} --intervention=erase --seed={{ SEED }} --steps={{ STEPS }} --out-tag=_sweep
+    pueue add -w "$PWD" -o=-8 -l "why: {{ PRESET }} route s{{ SEED }} x{{ STEPS }}; resolve: deploy-hack < vanilla on held-out, |Bh|>0" -- {{ TRAIN }} {{ PRESET }} --intervention=route --seed={{ SEED }} --steps={{ STEPS }} --out-tag=_sweep --eval-ablate-every=10 --vhack-refresh-every=10 --eval-n-prompts=2

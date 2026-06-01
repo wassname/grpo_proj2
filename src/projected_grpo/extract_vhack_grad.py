@@ -48,11 +48,11 @@ def extract_v_hack(model, tok, wrappers: dict[str, Wrap], pairs: list[Pair],
             assert torch.isfinite(ℒ), f"non-finite NLL on {label} pair"   # fail fast, never skip
             ℒ.backward()
             for n, w in wrappers.items():
-                G[label][n].append(w.δS.grad.detach().clone())
+                G[label][n].append(w.B.grad.reshape(-1).detach().clone())   # (d_out·r,)
 
     V_hack, V_sv = {}, {}
     for n in wrappers:
-        D = torch.stack(G["hack"][n]) - torch.stack(G["clean"][n])         # (n_pairs, r); pairing cancels prompt noise
+        D = torch.stack(G["hack"][n]) - torch.stack(G["clean"][n])         # (n_pairs, d_out·r); pairing cancels prompt noise
         U_d, S_d, Vh_d = torch.linalg.svd(D.float(), full_matrices=False)
         V = Vh_d[:k]                                                       # (k, r), rows orthonormal in ℝ^r
         # orient hack-ward by per-pair majority vote (outlier-robust; proj gates on ⟨g,v_i⟩>0)
